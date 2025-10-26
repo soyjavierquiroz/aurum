@@ -1,0 +1,72 @@
+version: '3.8'
+
+services:
+  aurum-bot:
+    image: aurum-bot:latest
+    working_dir: /opt/projects/aurum
+    volumes:
+      - /opt/projects/aurum:/opt/projects/aurum
+    command: npm start
+    environment:
+      # === MISMA DB QUE MIDAS (RELLENAR EN PORTAINER) ===
+      DB_HOST: "wordpress_db"
+      DB_USER: "<DB_USER>"
+      DB_PASSWORD: "<DB_PASSWORD>"
+      DB_NAME: "bot_kurukin_wp"
+
+      # Redis (rellenar si aplica)
+      REDIS_HOST: "redis"
+      REDIS_PORT: "6379"
+      REDIS_DB: "0"
+      REDIS_PASSWORD: ""
+
+      NODE_ENV: "production"
+      APP_NAME: "aurum"
+      APP_PORT: "4001"
+      APP_TRUST_PROXY: "1"
+      DEFAULT_TIMEZONE: "America/La_Paz"
+
+    deploy:
+      labels:
+        - "traefik.enable=true"
+        - "traefik.http.routers.kurukinaurum.rule=Host(`aurum.kurukin.com`)"
+        - "traefik.http.routers.kurukinaurum.entrypoints=websecure"
+        - "traefik.http.routers.kurukinaurum.tls.certresolver=le"
+        - "traefik.http.routers.kurukinaurum.tls=true"
+        - "traefik.http.services.kurukinaurum.loadbalancer.server.port=4001"
+    networks:
+      - general_network
+      - traefik_public
+
+  aurum-worker:
+    image: aurum-bot:latest
+    working_dir: /opt/projects/aurum
+    volumes:
+      - /opt/projects/aurum:/opt/projects/aurum
+    command: npm run worker
+    environment:
+      DB_HOST: "wordpress_db"
+      DB_USER: "<DB_USER>"
+      DB_PASSWORD: "<DB_PASSWORD>"
+      DB_NAME: "bot_kurukin_wp"
+
+      REDIS_HOST: "redis"
+      REDIS_PORT: "6379"
+      REDIS_DB: "0"
+      REDIS_PASSWORD: ""
+
+      NODE_ENV: "production"
+      APP_NAME: "aurum"
+      DEFAULT_TIMEZONE: "America/La_Paz"
+
+    deploy:
+      labels:
+        - "traefik.enable=false"
+    networks:
+      - general_network
+
+networks:
+  general_network:
+    external: true
+  traefik_public:
+    external: true
