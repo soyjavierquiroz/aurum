@@ -9,6 +9,7 @@ import { getKnex } from '../db/knex.js';
 const connection = getRedis();
 export const ping10Queue = connection ? new Queue('ping10', { connection }) : null;
 export const remindersQueue = connection ? new Queue('reminders', { connection }) : null;
+export const opsQueue = connection ? new Queue('ops', { connection }) : null;
 
 export function convKey({ user_id, telefono, instancia_evolution_api, dominio }) {
   return `${user_id}:${telefono}:${instancia_evolution_api}:${dominio}`;
@@ -20,6 +21,7 @@ async function removeJobIfExists(queue, jobId) {
   if (job) await job.remove();
 }
 
+// ================ Ping10 =================
 export async function schedulePing10(conv, lastActivityISO, tz) {
   if (!ping10Queue) return;
   const key = convKey(conv);
@@ -43,6 +45,7 @@ export async function cancelPing10(conv) {
   await removeJobIfExists(ping10Queue, jobId);
 }
 
+// ================ Dependientes (1d/3d/7d) =================
 export async function scheduleDependentReminders(conv, baseISO, tz) {
   if (!remindersQueue) return;
   const base = DateTime.fromISO(baseISO);
@@ -63,6 +66,7 @@ export async function scheduleDependentReminders(conv, baseISO, tz) {
       removeOnComplete: true,
       removeOnFail: false
     });
+    // Persist
     const knex = getKnex();
     await knex('aurum_followups_queue').insert({
       user_id: conv.user_id,
@@ -101,6 +105,7 @@ export async function cancelDependentReminders(conv) {
     .update({ status: 'cancelled', updated_at: knex.fn.now() });
 }
 
+// ================ Independientes =================
 export async function scheduleIndependentReminder(conv, { scheduled_at, days_offset, kind = 'reminder_custom' }, tz) {
   if (!remindersQueue) return null;
   let when = scheduled_at ? DateTime.fromISO(scheduled_at) : DateTime.now().plus({ days: Number(days_offset || 0) });
@@ -137,4 +142,56 @@ export async function cancelReminderById(conv, id) {
     .where({ id, user_id: conv.user_id })
     .update({ status: 'cancelled', updated_at: knex.fn.now() });
   return affected > 0;
+}
+
+// ================ Pause / Resume =================
+export async function scheduleResume(conv, pausedUntilISO, tz) {
+  if (!opsQueue) return;
+  const until = nextWorkingMoment(DateTime.fromISO(pausedUntilISO).toJSDate(), tz).toJSDate();
+  const jobId = `ops:resume:${convKey(conv)}`;
+  await removeJobIfExists(opsQueue, jobId);
+  await opsQueue.add('ops_resume', { conv, paused_until: until.toISOString() }, {
+    jobId,
+    delay: Math.max(0, until.getTime() - Date.now()),
+    attempts: 3,
+    backoff: { type: 'exponential', delay: 5000 },
+    removeOnComplete: true,
+    removeOnFail: false
+  });
+  // Registra en cola DB (para observabilidad)
+  const knex = getKnex();
+  await knex('aurum_followups_queue').insert({
+    user_id: conv.user_id,
+    telefono: conv.telefono,
+    instancia_evolution_api: conv.instancia_evolution_api,
+    dominio: conv.dominio,
+    kind: 'ops_resume',
+    scheduled_at: until.toISOString().slice(0, 19).replace('T', ' '),
+    status: 'scheduled',
+    cancel_on_new_ping: 1
+  });
+}
+
+export async function cancelResume(conv) {
+  if (!opsQueue) return;
+  const jobId = `ops:resume:${convKey(conv)}`;
+  await removeJobIfExists(opsQueue, jobId);
+  const knex = getKnex();
+  await knex('aurum_followups_queue')
+    .where({
+      user_id: conv.user_id,
+      telefono: conv.telefono,
+      instancia_evolution_api: conv.instancia_evolution_api,
+      dominio: conv.dominio,
+      kind: 'ops_resume',
+      status: 'scheduled'
+    })
+    .update({ status: 'cancelled', updated_at: knex.fn.now() });
+}
+
+// ================ Cancelar todo (cuando se bloquea) =================
+export async function cancelAllForConversation(conv) {
+  await cancelPing10(conv);
+  await cancelDependentReminders(conv);
+  await cancelResume(conv);
 }

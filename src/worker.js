@@ -17,6 +17,7 @@ const REV = process.env.AURUM_REV || 'dev';
 
 export const ping10Queue = new Queue('ping10', { connection });
 export const remindersQueue = new Queue('reminders', { connection });
+export const opsQueue = new Queue('ops', { connection });
 
 function convKey({ user_id, telefono, instancia_evolution_api, dominio }) {
   return `${user_id}:${telefono}:${instancia_evolution_api}:${dominio}`;
@@ -31,12 +32,8 @@ async function fetchUserSettings(knex, user_id) {
 
 async function fetchLead(knex, conv) {
   const row = await knex('wa_bot_leads')
-    .select(
-      'lead_id','user_id','telefono','instancia_evolution_api','dominio',
-      'nombre','apellido','zona_horaria','payload'
-    )
+    .select('lead_id','user_id','telefono','instancia_evolution_api','dominio','nombre','apellido','zona_horaria','payload','lead_status')
     .where(conv).first();
-
   if (!row) return null;
 
   let payloadParsed = null;
@@ -44,7 +41,6 @@ async function fetchLead(knex, conv) {
     try { payloadParsed = typeof row.payload === 'string' ? JSON.parse(row.payload) : row.payload; }
     catch { payloadParsed = row.payload; }
   }
-
   const nombreCompleto = [row.nombre, row.apellido].filter(Boolean).join(' ') || null;
 
   return {
@@ -57,10 +53,12 @@ async function fetchLead(knex, conv) {
     apellido: row.apellido ?? null,
     nombre_completo: nombreCompleto,
     zona_horaria: row.zona_horaria ?? null,
-    payload: payloadParsed
+    payload: payloadParsed,
+    lead_status: row.lead_status ?? null
   };
 }
 
+// ---------------- Worker Ping10 ----------------
 new Worker('ping10', async (job) => {
   const knex = getKnex();
   const { conv } = job.data;
@@ -81,15 +79,16 @@ new Worker('ping10', async (job) => {
     return;
   }
 
-  const { PING_URL } = await fetchUserSettings(knex, conv.user_id);
+  const settings = await fetchUserSettings(knex, conv.user_id);
+  const PING_URL = settings.PING_URL;
   const summary = (convRow.window_msg_count || 0) >= 3;
-  const leadInfo = await fetchLead(knex, conv); // <-- incluir en payload
+  const leadInfo = await fetchLead(knex, conv);
 
   if (PING_URL) {
     const payload = {
       version: REV,
       conversation: conv,
-      lead: leadInfo, // <-- aquí va
+      lead: leadInfo, // incluye nombre/apellido/payload/lead_status
       summary,
       last_activity_at: convRow.last_activity_at,
       window_msg_count: convRow.window_msg_count,
@@ -121,6 +120,7 @@ new Worker('ping10', async (job) => {
   `, [conv.user_id, conv.telefono, conv.instancia_evolution_api, conv.dominio]);
 }, { connection });
 
+// ---------------- Worker Reminders ----------------
 new Worker('reminders', async (job) => {
   const knex = getKnex();
   const { conv, kind, reminder_id, scheduled_at } = job.data;
@@ -143,9 +143,44 @@ new Worker('reminders', async (job) => {
   }
 
   if (reminder_id) {
-    await knex('aurum_followups_queue').where({ id: reminder_id })
+    await knex('aurum_followups_queue')
+      .where({ id: reminder_id })
       .update({ status: 'done', updated_at: knex.fn.now() });
   }
+}, { connection });
+
+// ---------------- Worker Ops (resume) ----------------
+new Worker('ops', async (job) => {
+  const knex = getKnex();
+  const { name } = job;
+  if (name !== 'ops_resume') return;
+
+  const { conv } = job.data;
+
+  // Set contactable en Aurum y Midas
+  await knex.raw(`
+    INSERT INTO aurum_lead_state (user_id, telefono, instancia_evolution_api, dominio, operational_status_key, effective_at, source, created_at, updated_at)
+    VALUES (?, ?, ?, ?, 'contactable', NOW(), 'ops_resume', NOW(), NOW())
+    ON DUPLICATE KEY UPDATE operational_status_key='contactable', effective_at=NOW(), source='ops_resume', updated_at=NOW()
+  `, [conv.user_id, conv.telefono, conv.instancia_evolution_api, conv.dominio]);
+
+  await knex('wa_bot_leads')
+    .where(conv)
+    .update({ lead_status: 'contactable', lead_status_updated_at: knex.fn.now() });
+
+  // Marcar registro en cola DB como done
+  await knex('aurum_followups_queue')
+    .where({
+      user_id: conv.user_id,
+      telefono: conv.telefono,
+      instancia_evolution_api: conv.instancia_evolution_api,
+      dominio: conv.dominio,
+      kind: 'ops_resume',
+      status: 'scheduled'
+    })
+    .update({ status: 'done', updated_at: knex.fn.now() });
+
+  logger.info({ conv }, 'ops_resume executed -> contactable');
 }, { connection });
 
 logger.info({ rev: REV }, 'aurum worker ready');
