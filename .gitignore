@@ -1,0 +1,23 @@
+# node
+node_modules
+npm-debug.log*
+.yarn/*
+.pnpm-store
+
+# env & local
+.env
+.env.*.local
+.DS_Store
+.vscode
+
+# docker
+docker-compose*.yml
+docker-stack.yml
+*.local.yml
+
+# logs
+logs
+*.log
+
+# misc
+*.sql
