@@ -1,90 +1,116 @@
+// src/routes/webhooks.js
 import { Router } from 'express';
-import crypto from 'node:crypto';
 import { getKnex } from '../db/knex.js';
+import { logger as defaultLogger } from '../lib/logger.js';
 import { msgOnce } from '../clients/redis.js';
-import { schedulePing10, cancelPing10, cancelDependentReminders, cancelResume } from '../services/jobs.js';
-import { DateTime } from 'luxon';
+import { ping10Queue } from '../services/jobs.js';
+import { incomingMessageCounter } from '../metrics.js';
 
-const BLOCKED = ['won', 'opt_out', 'invalid', 'stopped'];
+function buildConv({ user_id, telefono, instancia_evolution_api, dominio }) {
+  return {
+    user_id: Number(user_id),
+    telefono: String(telefono || '').trim(),
+    instancia_evolution_api: String(instancia_evolution_api || '').trim(),
+    dominio: String(dominio || '').trim(),
+  };
+}
 
-export function webhookRoutes({ logger }) {
+function normalizeTelefono(raw) {
+  if (!raw) return '';
+  return String(raw).replace(/\D/g, '');
+}
+
+/**
+ * Rutas de webhooks (MVP):
+ *  - POST /webhooks/message
+ *      Body: { user_id, telefono | telefono_raw, instancia_evolution_api|instance|instanceId, dominio, msg_id?, ts?(epoch ms) }
+ *      Idempotencia por msg_id; crea/actualiza conversación; reprograma ping10 para +10min desde ts.
+ */
+export function webhookRoutes({ logger } = {}) {
+  const log = logger || defaultLogger;
   const router = Router();
 
   router.post('/webhooks/message', async (req, res) => {
-    const { user_id, telefono, instancia_evolution_api, dominio, ts, msg_id } = req.body || {};
-    if (!user_id || !telefono || !instancia_evolution_api || typeof dominio === 'undefined') {
-      return res.status(400).json({ error: 'bad_request', details: 'missing conversation key', trace_id: req.traceId });
-    }
-
-    // Idempotencia por msg_id (o hash del body si falta)
-    const bodyStr = JSON.stringify(req.body);
-    const dedupeKey = `msg:${msg_id || crypto.createHash('sha1').update(bodyStr).digest('hex')}`;
-    const firstTime = await msgOnce(dedupeKey, 86400);
-    if (!firstTime) {
-      return res.json({ ok: true, deduped: true, trace_id: req.traceId });
-    }
-
-    const knex = getKnex();
-    // Verificar existencia en Midas
-    const lead = await knex('wa_bot_leads')
-      .select('lead_id', 'zona_horaria', 'lead_status', 'lead_business_status_key')
-      .where({ user_id, telefono, instancia_evolution_api, dominio })
-      .first();
-
-    if (!lead) {
-      logger.warn({ user_id, telefono, instancia_evolution_api, dominio, trace_id: req.traceId }, 'lead_no_encontrado');
-      return res.status(404).json({ error: 'lead_no_encontrado', trace_id: req.traceId });
-    }
-
-    const now = DateTime.now();
-    const eventTs = ts ? DateTime.fromMillis(Number(ts)) : now;
-    const conv = { user_id, telefono, instancia_evolution_api, dominio };
-    const tzEffective = lead.zona_horaria || process.env.DEFAULT_TIMEZONE || 'America/La_Paz';
-
-    // UPSERT conversación (+2 mensajes)
     try {
-      await knex.raw(`
-        INSERT INTO aurum_conversations (user_id, telefono, instancia_evolution_api, dominio, last_activity_at, window_msg_count, timezone_effective, working_window, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, 2, ?, NULL, NOW(), NOW())
-        ON DUPLICATE KEY UPDATE
-          last_activity_at = GREATEST(VALUES(last_activity_at), last_activity_at),
-          window_msg_count = window_msg_count + 2,
-          timezone_effective = VALUES(timezone_effective),
-          updated_at = NOW()
-      `, [user_id, telefono, instancia_evolution_api, dominio, eventTs.toSQL({ includeOffset: false }), tzEffective]);
-    } catch (e) {
-      logger.error({ err: e, trace_id: req.traceId }, 'update_conversation_failed');
+      const b = req.body || {};
+
+      // Permitir telefono_raw; permitir instance|instanceId como alias
+      const telefono = b.telefono ? b.telefono : normalizeTelefono(b.telefono_raw);
+      const instancia = b.instancia_evolution_api || b.instance || b.instanceId;
+
+      const conv = buildConv({
+        user_id: b.user_id,
+        telefono,
+        instancia_evolution_api: instancia,
+        dominio: b.dominio,
+      });
+
+      // Validación mínima
+      if (!conv.user_id || !conv.telefono || !conv.instancia_evolution_api || !conv.dominio) {
+        incomingMessageCounter.labels('bad_request').inc();
+        return res.status(400).json({ error: 'bad_request', trace_id: req.traceId });
+      }
+
+      // Idempotencia por msg_id (si hay)
+      if (b.msg_id) {
+        const first = await msgOnce(b.msg_id);
+        if (!first) {
+          incomingMessageCounter.labels('deduped').inc();
+          return res.json({ ok: true, deduped: true, trace_id: req.traceId });
+        }
+      }
+
+      // Timestamp (epoch ms) con fallback a ahora
+      const tsMs = Number.isFinite(Number(b.ts)) ? Number(b.ts) : Date.now();
+
+      const knex = getKnex();
+
+      // Asegurar conversación y last_activity_at
+      const tzEff = process.env.DEFAULT_TIMEZONE || 'America/La_Paz';
+      const existing = await knex('aurum_conversations').where(conv).first();
+
+      if (!existing) {
+        await knex('aurum_conversations').insert({
+          ...conv,
+          last_activity_at: new Date(tsMs),
+          window_msg_count: 1,
+          timezone_effective: tzEff,
+          created_at: knex.fn.now(),
+          updated_at: knex.fn.now()
+        });
+      } else {
+        await knex('aurum_conversations')
+          .where(conv)
+          .update({
+            last_activity_at: new Date(tsMs),
+            window_msg_count: (existing.window_msg_count || 0) + 1,
+            updated_at: knex.fn.now()
+          });
+      }
+
+      // Reprogramar ping10 para +10 minutos desde ts
+      const delayMs = Math.max(0, (tsMs + 10 * 60 * 1000) - Date.now());
+      const key = `${conv.user_id}:${conv.telefono}:${conv.instancia_evolution_api}:${conv.dominio}`;
+
+      await ping10Queue.add('ping10', { conv }, {
+        jobId: `ping10:${key}`,
+        delay: delayMs,
+        attempts: 1,
+        removeOnComplete: true,
+        removeOnFail: false
+      });
+
+      incomingMessageCounter.labels('accepted').inc();
+      return res.json({ ok: true, reprogrammed_ping10: true, trace_id: req.traceId });
+    } catch (err) {
+      log.error({ err, trace_id: req.traceId }, 'webhooks.message failed');
+      incomingMessageCounter.labels('error').inc();
       return res.status(500).json({ error: 'internal_error', trace_id: req.traceId });
     }
-
-    // Cancelar jobs previos relevantes y reprogramar Ping10
-    await cancelPing10(conv);
-    await cancelDependentReminders(conv);
-    await cancelResume(conv); // <--- NUEVO
-    await schedulePing10(conv, eventTs.toISO(), tzEffective);
-
-    // NO reabrir bloqueados automáticamente
-    if (!lead.lead_status || !BLOCKED.includes(lead.lead_status)) {
-      try {
-        // Aurum
-        await knex.raw(`
-          INSERT INTO aurum_lead_state (user_id, telefono, instancia_evolution_api, dominio, operational_status_key, effective_at, source, created_at, updated_at)
-          VALUES (?, ?, ?, ?, 'contactable', NOW(), 'webhook', NOW(), NOW())
-          ON DUPLICATE KEY UPDATE operational_status_key='contactable', effective_at=NOW(), source='webhook', updated_at=NOW()
-        `, [user_id, telefono, instancia_evolution_api, dominio]);
-        // Midas
-        await knex('wa_bot_leads')
-          .where({ user_id, telefono, instancia_evolution_api, dominio })
-          .update({ lead_status: 'contactable', lead_status_updated_at: knex.fn.now() });
-      } catch (e) {
-        logger.error({ err: e, trace_id: req.traceId }, 'update_status_failed');
-      }
-    } else {
-      logger.info({ user_id, telefono, instancia_evolution_api, dominio, lead_status: lead.lead_status }, 'webhook: status blocked, not reopening');
-    }
-
-    return res.json({ ok: true, reprogrammed_ping10: true, trace_id: req.traceId });
   });
 
   return router;
 }
+
+// Export alias para compatibilidad: singular y plural
+export { webhookRoutes as webhooksRoutes };

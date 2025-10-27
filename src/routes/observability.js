@@ -1,51 +1,61 @@
+// src/routes/observability.js
 import { Router } from 'express';
-import { register, httpRequestDuration } from '../lib/metrics.js';
-import { pingDB } from '../clients/mysql.js';
 import { pingRedis } from '../clients/redis.js';
+import { getKnex } from '../db/knex.js';
+import { metricsHandler } from '../metrics.js';
+
+const REV = process.env.AURUM_REV || 'dev';
 
 export function observabilityRoutes({ logger }) {
   const router = Router();
 
+  // --- /healthz: liveness ---
   router.get('/healthz', async (req, res) => {
-    res.json({
+    const startedAt = Number(process.uptime());
+    return res.json({
       status: 'ok',
-      uptime: process.uptime(),
+      uptime: startedAt,
       now: new Date().toISOString(),
-      trace_id: req.traceId
+      version: REV,
+      trace_id: req.traceId,
     });
   });
 
+  // --- /readyz: readiness con chequeos básicos ---
   router.get('/readyz', async (req, res) => {
-    const start = process.hrtime.bigint();
-
-    const [db, redis] = await Promise.all([
-      pingDB(), pingRedis()
-    ]);
-
-    const allConfigured = [db, redis].every(x => x.configured);
-    const allOk = [db, redis].every(x => x.ok);
-
-    const statusCode = allConfigured ? (allOk ? 200 : 503) : 200;
-
-    const body = {
-      status: statusCode === 200 ? 'ready' : 'not_ready',
-      dependencies: { db, redis },
-      trace_id: req.traceId
+    const deps = {
+      db: { configured: false, ok: false },
+      redis: { configured: false, ok: false },
     };
 
-    const end = process.hrtime.bigint();
-    const duration = Number(end - start) / 1e9;
-    httpRequestDuration.labels('GET', '/readyz', String(statusCode)).observe(duration);
+    // Redis
+    const r = await pingRedis();
+    deps.redis.configured = r.error !== 'no_redis';
+    deps.redis.ok = !!r.ok;
 
-    if (statusCode !== 200) logger.warn({ ...body }, 'readiness check not ready');
+    // DB (Knex)
+    try {
+      const knex = getKnex();
+      if (knex) {
+        deps.db.configured = true;
+        await knex.raw('SELECT 1'); // ping
+        deps.db.ok = true;
+      }
+    } catch {
+      deps.db.ok = false;
+    }
 
-    res.status(statusCode).json(body);
+    const ready = deps.db.ok && deps.redis.ok;
+    res.status(ready ? 200 : 503).json({
+      status: ready ? 'ready' : 'not_ready',
+      version: REV,
+      dependencies: deps,
+      trace_id: req.traceId,
+    });
   });
 
-  router.get('/metrics', async (req, res) => {
-    res.setHeader('Content-Type', register.contentType);
-    res.end(await register.metrics());
-  });
+  // --- /metrics: Prometheus ---
+  router.get('/metrics', metricsHandler);
 
   return router;
 }
