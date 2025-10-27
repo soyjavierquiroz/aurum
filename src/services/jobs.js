@@ -21,17 +21,17 @@ async function removeJobIfExists(queue, jobId) {
   if (job) await job.remove();
 }
 
-// ================ Ping10 =================
+// ------------ Ping10 ------------
 export async function schedulePing10(conv, lastActivityISO, tz) {
   if (!ping10Queue) return;
   const key = convKey(conv);
   const jobId = `ping10:${key}`;
-  const lastActivity = lastActivityISO ? DateTime.fromISO(lastActivityISO) : DateTime.now();
-  const scheduled = nextWorkingMoment(lastActivity.plus({ minutes: 10 }).toJSDate(), tz).toJSDate();
+  const base = lastActivityISO ? DateTime.fromISO(lastActivityISO) : DateTime.now();
+  const when = nextWorkingMoment(base.plus({ minutes: 10 }).toJSDate(), tz).toJSDate();
   await removeJobIfExists(ping10Queue, jobId);
-  await ping10Queue.add('ping10', { conv, scheduled_at: scheduled.toISOString() }, {
+  await ping10Queue.add('ping10', { conv, scheduled_at: when.toISOString() }, {
     jobId,
-    delay: Math.max(0, scheduled.getTime() - Date.now()),
+    delay: Math.max(0, when.getTime() - Date.now()),
     attempts: 3,
     backoff: { type: 'exponential', delay: 5000 },
     removeOnComplete: true,
@@ -41,11 +41,10 @@ export async function schedulePing10(conv, lastActivityISO, tz) {
 
 export async function cancelPing10(conv) {
   if (!ping10Queue) return;
-  const jobId = `ping10:${convKey(conv)}`;
-  await removeJobIfExists(ping10Queue, jobId);
+  await removeJobIfExists(ping10Queue, `ping10:${convKey(conv)}`);
 }
 
-// ================ Dependientes (1d/3d/7d) =================
+// ------------ Dependientes 1d/3d/7d ------------
 export async function scheduleDependentReminders(conv, baseISO, tz) {
   if (!remindersQueue) return;
   const base = DateTime.fromISO(baseISO);
@@ -54,11 +53,17 @@ export async function scheduleDependentReminders(conv, baseISO, tz) {
     ['reminder_3d', { days: 3 }, '3d'],
     ['reminder_7d', { days: 7 }, '7d']
   ];
+  const knex = getKnex();
+
   for (const [kind, delta, slot] of kinds) {
     const at = nextWorkingMoment(base.plus(delta).toJSDate(), tz).toJSDate();
     const jobId = `reminder:dep:${kind}:${convKey(conv)}:${slot}`;
+
+    // (1) En cola BullMQ
     await removeJobIfExists(remindersQueue, jobId);
-    await remindersQueue.add('reminder', { conv, kind, scheduled_at: at.toISOString(), cancel_on_new_ping: true }, {
+    await remindersQueue.add('reminder', {
+      conv, kind, scheduled_at: at.toISOString(), cancel_on_new_ping: true
+    }, {
       jobId,
       delay: Math.max(0, at.getTime() - Date.now()),
       attempts: 3,
@@ -66,8 +71,8 @@ export async function scheduleDependentReminders(conv, baseISO, tz) {
       removeOnComplete: true,
       removeOnFail: false
     });
-    // Persist
-    const knex = getKnex();
+
+    // (2) Persistencia en DB (lo que lista /reminders)
     await knex('aurum_followups_queue').insert({
       user_id: conv.user_id,
       telefono: conv.telefono,
@@ -76,7 +81,9 @@ export async function scheduleDependentReminders(conv, baseISO, tz) {
       kind,
       scheduled_at: at.toISOString().slice(0, 19).replace('T', ' '),
       status: 'scheduled',
-      cancel_on_new_ping: 1
+      cancel_on_new_ping: 1,
+      created_at: knex.fn.now(),
+      updated_at: knex.fn.now()
     });
   }
 }
@@ -84,12 +91,11 @@ export async function scheduleDependentReminders(conv, baseISO, tz) {
 export async function cancelDependentReminders(conv) {
   if (!remindersQueue) return;
   const key = convKey(conv);
-  const patterns = [
+  for (const jobId of [
     `reminder:dep:reminder_1d:${key}:1d`,
     `reminder:dep:reminder_3d:${key}:3d`,
     `reminder:dep:reminder_7d:${key}:7d`
-  ];
-  for (const jobId of patterns) {
+  ]) {
     await removeJobIfExists(remindersQueue, jobId);
   }
   const knex = getKnex();
@@ -105,11 +111,12 @@ export async function cancelDependentReminders(conv) {
     .update({ status: 'cancelled', updated_at: knex.fn.now() });
 }
 
-// ================ Independientes =================
+// ------------ Independientes ------------
 export async function scheduleIndependentReminder(conv, { scheduled_at, days_offset, kind = 'reminder_custom' }, tz) {
   if (!remindersQueue) return null;
   let when = scheduled_at ? DateTime.fromISO(scheduled_at) : DateTime.now().plus({ days: Number(days_offset || 0) });
   when = nextWorkingMoment(when.toJSDate(), tz);
+
   const knex = getKnex();
   const [id] = await knex('aurum_followups_queue').insert({
     user_id: conv.user_id,
@@ -117,10 +124,13 @@ export async function scheduleIndependentReminder(conv, { scheduled_at, days_off
     instancia_evolution_api: conv.instancia_evolution_api,
     dominio: conv.dominio,
     kind,
-    scheduled_at: when.toISO({ suppressMilliseconds: true }).replace('T', ' ').slice(0, 19),
+    scheduled_at: when.toISO({ suppressMilliseconds: true }).replace('T', ' ').slice(0,19),
     status: 'scheduled',
-    cancel_on_new_ping: 0
+    cancel_on_new_ping: 0,
+    created_at: knex.fn.now(),
+    updated_at: knex.fn.now()
   });
+
   const jobId = `reminder:ind:${convKey(conv)}:${id}`;
   await remindersQueue.add('reminder', { conv, kind, reminder_id: id, scheduled_at: when.toISO(), cancel_on_new_ping: false }, {
     jobId,
@@ -130,13 +140,13 @@ export async function scheduleIndependentReminder(conv, { scheduled_at, days_off
     removeOnComplete: true,
     removeOnFail: false
   });
+
   return id;
 }
 
 export async function cancelReminderById(conv, id) {
   if (!remindersQueue) return false;
-  const jobId = `reminder:ind:${convKey(conv)}:${id}`;
-  await removeJobIfExists(remindersQueue, jobId);
+  await removeJobIfExists(remindersQueue, `reminder:ind:${convKey(conv)}:${id}`);
   const knex = getKnex();
   const affected = await knex('aurum_followups_queue')
     .where({ id, user_id: conv.user_id })
@@ -144,21 +154,20 @@ export async function cancelReminderById(conv, id) {
   return affected > 0;
 }
 
-// ================ Pause / Resume =================
+// ------------ Pausa/Resume + Cancel all ------------
 export async function scheduleResume(conv, pausedUntilISO, tz) {
   if (!opsQueue) return;
-  const until = nextWorkingMoment(DateTime.fromISO(pausedUntilISO).toJSDate(), tz).toJSDate();
   const jobId = `ops:resume:${convKey(conv)}`;
+  const when = nextWorkingMoment(DateTime.fromISO(pausedUntilISO).toJSDate(), tz).toJSDate();
   await removeJobIfExists(opsQueue, jobId);
-  await opsQueue.add('ops_resume', { conv, paused_until: until.toISOString() }, {
+  await opsQueue.add('ops_resume', { conv, paused_until: when.toISOString() }, {
     jobId,
-    delay: Math.max(0, until.getTime() - Date.now()),
+    delay: Math.max(0, when.getTime() - Date.now()),
     attempts: 3,
     backoff: { type: 'exponential', delay: 5000 },
     removeOnComplete: true,
     removeOnFail: false
   });
-  // Registra en cola DB (para observabilidad)
   const knex = getKnex();
   await knex('aurum_followups_queue').insert({
     user_id: conv.user_id,
@@ -166,16 +175,17 @@ export async function scheduleResume(conv, pausedUntilISO, tz) {
     instancia_evolution_api: conv.instancia_evolution_api,
     dominio: conv.dominio,
     kind: 'ops_resume',
-    scheduled_at: until.toISOString().slice(0, 19).replace('T', ' '),
+    scheduled_at: when.toISOString().slice(0, 19).replace('T', ' '),
     status: 'scheduled',
-    cancel_on_new_ping: 1
+    cancel_on_new_ping: 1,
+    created_at: knex.fn.now(),
+    updated_at: knex.fn.now()
   });
 }
 
 export async function cancelResume(conv) {
   if (!opsQueue) return;
-  const jobId = `ops:resume:${convKey(conv)}`;
-  await removeJobIfExists(opsQueue, jobId);
+  await removeJobIfExists(opsQueue, `ops:resume:${convKey(conv)}`);
   const knex = getKnex();
   await knex('aurum_followups_queue')
     .where({
@@ -189,7 +199,6 @@ export async function cancelResume(conv) {
     .update({ status: 'cancelled', updated_at: knex.fn.now() });
 }
 
-// ================ Cancelar todo (cuando se bloquea) =================
 export async function cancelAllForConversation(conv) {
   await cancelPing10(conv);
   await cancelDependentReminders(conv);

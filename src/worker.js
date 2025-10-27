@@ -123,25 +123,88 @@ new Worker('ping10', async (job) => {
 // ---------------- Worker Reminders ----------------
 new Worker('reminders', async (job) => {
   const knex = getKnex();
-  const { conv, kind, reminder_id, scheduled_at } = job.data;
+  const { conv, kind, reminder_id, scheduled_at, cancel_on_new_ping } = job.data || {};
 
+  // slot/days/type
+  let slot = null;
+  if (typeof kind === 'string' && /^reminder_\d+d$/.test(kind)) {
+    slot = kind.split('_')[1]; // "1d" | "3d" | "7d"
+  }
+  const days = slot ? Number(slot.replace('d', '')) : null;
+  const type = reminder_id ? 'independent' : (cancel_on_new_ping ? 'dependent' : 'unknown');
+
+  // trae datos del lead (mismo knex/DB Midas)
+  const leadInfo = await (async () => {
+    try {
+      const row = await knex('wa_bot_leads')
+        .select(
+          'lead_id','user_id','telefono','instancia_evolution_api','dominio',
+          'nombre','apellido','zona_horaria','payload','lead_status','lead_business_status_key'
+        )
+        .where(conv)
+        .first();
+      if (!row) return null;
+
+      let payloadParsed = null;
+      if (row.payload != null) {
+        try { payloadParsed = typeof row.payload === 'string' ? JSON.parse(row.payload) : row.payload; }
+        catch { payloadParsed = row.payload; }
+      }
+      const nombreCompleto = [row.nombre, row.apellido].filter(Boolean).join(' ') || null;
+
+      return {
+        lead_id: row.lead_id ?? null,
+        user_id: row.user_id,
+        telefono: row.telefono,
+        instancia_evolution_api: row.instancia_evolution_api,
+        dominio: row.dominio,
+        nombre: row.nombre ?? null,
+        apellido: row.apellido ?? null,
+        nombre_completo: nombreCompleto,
+        zona_horaria: row.zona_horaria ?? null,
+        payload: payloadParsed,
+        lead_status: row.lead_status ?? null,
+        lead_business_status_key: row.lead_business_status_key ?? null
+      };
+    } catch {
+      return null;
+    }
+  })();
+
+  // URL destino
   const row = await knex('aurum_user_settings').select('REMINDER_URL').where({ user_id: conv.user_id }).first();
   const REMINDER_URL = row?.REMINDER_URL;
 
   if (REMINDER_URL) {
-    const payload = { version: REV, conversation: conv, kind, reminder_id, scheduled_at, trace_id: `rem-${job.id}` };
+    const payload = {
+      version: REV,
+      conversation: conv,
+      lead: leadInfo,                 // <-- incluimos datos del lead
+      kind,                           // p.ej. "reminder_1d" | "reminder_custom"
+      slot,                           // "1d"|"3d"|"7d" | null
+      days,                           // 1|3|7 | null
+      type,                           // "dependent" | "independent" | "unknown"
+      cancel_on_new_ping: !!cancel_on_new_ping,
+      reminder_id: reminder_id ?? null,
+      scheduled_at,
+      trace_id: `rem-${job.id}`
+    };
+
     try {
       const rsp = await fetch(REMINDER_URL, {
         method: 'POST',
         headers: { 'content-type': 'application/json', 'x-aurum-rev': REV },
         body: JSON.stringify(payload)
       });
-      logger.info({ status: rsp.status, key: convKey(conv), kind }, 'reminder webhook sent');
+      logger.info({ status: rsp.status, key: `${conv.user_id}:${conv.telefono}:${conv.instancia_evolution_api}:${conv.dominio}`, kind, slot }, 'reminder webhook sent');
     } catch (e) {
-      logger.error({ err: e, key: convKey(conv), kind }, 'reminder webhook failed');
+      logger.error({ err: e, key: `${conv.user_id}:${conv.telefono}:${conv.instancia_evolution_api}:${conv.dominio}`, kind, slot }, 'reminder webhook failed');
     }
+  } else {
+    logger.warn({ key: `${conv.user_id}:${conv.telefono}:${conv.instancia_evolution_api}:${conv.dominio}`, kind }, 'REMINDER_URL missing; skipping webhook');
   }
 
+  // Marcar done solo si es independiente (tiene ID persistido)
   if (reminder_id) {
     await knex('aurum_followups_queue')
       .where({ id: reminder_id })

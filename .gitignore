@@ -21,3 +21,8 @@ logs
 
 # misc
 *.sql
+
+# local
+.env
+*.local.*
+
