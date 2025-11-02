@@ -7,6 +7,7 @@ import { webhookRoutes } from './routes/webhooks.js';
 import { leadsRoutes } from './routes/leads.js';
 import { remindersRoutes } from './routes/reminders.js';
 import { adminRoutes } from './routes/admin.js';
+import { turnRoutes } from './routes/turns.js'; // <-- NUEVO
 
 export function buildApp() {
   const app = express();
@@ -24,19 +25,27 @@ export function buildApp() {
     serializers: {
       req(req) {
         return {
-          method: req.method, url: req.url, trace_id: req.traceId,
-          remoteAddress: req.ip, userAgent: req.headers['user-agent']
+          method: req.method,
+          url: req.url,
+          trace_id: req.traceId,
+          remoteAddress: req.ip,
+          userAgent: req.headers['user-agent'],
         };
       },
-      res(res) { return { statusCode: res.statusCode }; }
+      res(res) {
+        return { statusCode: res.statusCode };
+      },
     },
-    customSuccessMessage(req, res) { return `${req.method} ${req.url} -> ${res.statusCode}`; }
+    customSuccessMessage(req, res) {
+      return `${req.method} ${req.url} -> ${res.statusCode}`;
+    },
   }));
 
   app.use(observabilityRoutes({ logger }));
   app.use(webhookRoutes({ logger }));
   app.use(leadsRoutes({ logger }));
   app.use(remindersRoutes({ logger }));
+  app.use(turnRoutes({ logger }));   // <-- NUEVO
   app.use(adminRoutes({ logger }));
 
   app.use((req, res) => res.status(404).json({ error: 'not_found', trace_id: req.traceId }));

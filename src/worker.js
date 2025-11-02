@@ -5,7 +5,7 @@ const { Queue, Worker } = BullMQ;
 import { getRedis } from './clients/redis.js';
 import { logger } from './lib/logger.js';
 import { getKnex } from './db/knex.js';
-import { scheduleDependentReminders } from './services/jobs.js';
+import { scheduleDependentReminders, cancelDependentReminders } from './services/jobs.js';
 import { DateTime } from 'luxon';
 
 import {
@@ -132,18 +132,17 @@ new Worker('ping10', async (job) => {
   const now = DateTime.now().setZone(tz);
 
   // Ejecuta solo si pasaron >= 10 min
-  if (!lastActivity || now.diff(lastActivity, 'minutes').minutes < 9.99) {
+  if (!lastActivity || now.diff(lastActivity, 'minutes').minutes < 10 - 0.01) {
     logger.info({ jobId: job.id, key }, 'ping10: skipped (activity within 10min)');
     workerJobsProcessedCounter.labels('ping10', 'skipped').inc();
     return;
   }
 
-  // Enriquecer con lead + estados Midas + aurum (para webhook y para decidir scheduling)
-  const leadInfo = await fetchLead(knex, conv);
-  const aurumState = await fetchAurumState(knex, conv);
-
   const { PING_URL } = await fetchUserSettings(knex, conv.user_id);
   const summary = (convRow.window_msg_count || 0) >= 3;
+
+  const leadInfo = await fetchLead(knex, conv);       // datos lead + estados Midas
+  const aurumState = await fetchAurumState(knex, conv); // último estado Aurum
 
   if (PING_URL) {
     try {
@@ -185,24 +184,24 @@ new Worker('ping10', async (job) => {
     .where(conv)
     .update({ window_msg_count: 0, last_ping_at: knex.fn.now(), updated_at: knex.fn.now() });
 
-  // ---------------- Condición: sólo agendar 1d/3d/7d si el lead está "contactable" ----------------
-  const leadStatus = String(leadInfo?.lead_status || '').toLowerCase();
-  const canSchedule = leadStatus === 'contactable';
+  // ---- NUEVO: cancelación defensiva antes de resembra ----
+  await cancelDependentReminders(conv);
 
-  if (canSchedule) {
+  // Re-sembrar dependientes solo si el lead está contactable
+  const leadStatus = (leadInfo?.lead_status || '').toLowerCase();
+  if (leadStatus === 'contactable') {
     await scheduleDependentReminders(conv, now.toISO(), tz);
-
-    // Marca operativa interna sólo si efectivamente agendamos
-    await knex.raw(`
-      INSERT INTO aurum_lead_state (user_id, telefono, instancia_evolution_api, dominio, operational_status_key, effective_at, source, created_at, updated_at)
-      VALUES (?, ?, ?, ?, 'reminder_scheduled', NOW(), 'ping10', NOW(), NOW())
-      ON DUPLICATE KEY UPDATE operational_status_key='reminder_scheduled', effective_at=NOW(), source='ping10', updated_at=NOW()
-    `, [conv.user_id, conv.telefono, conv.instancia_evolution_api, conv.dominio]);
-
     logger.info({ key, lead_status: leadStatus }, 'ping10: dependent reminders scheduled (1d/3d/7d)');
   } else {
-    logger.info({ key, lead_status: leadStatus }, 'ping10: skip dependent reminders (lead not contactable)');
+    logger.info({ key, lead_status: leadStatus }, 'ping10: skip dependent reminders (not contactable)');
   }
+
+  // Marca operativa interna opcional
+  await knex.raw(`
+    INSERT INTO aurum_lead_state (user_id, telefono, instancia_evolution_api, dominio, operational_status_key, effective_at, source, created_at, updated_at)
+    VALUES (?, ?, ?, ?, 'reminder_scheduled', NOW(), 'ping10', NOW(), NOW())
+    ON DUPLICATE KEY UPDATE operational_status_key='reminder_scheduled', effective_at=NOW(), source='ping10', updated_at=NOW()
+  `, [conv.user_id, conv.telefono, conv.instancia_evolution_api, conv.dominio]);
 
 }, { connection });
 
